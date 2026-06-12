@@ -2,6 +2,7 @@ import base64
 import json
 import re
 import unicodedata
+import uuid
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote_plus
@@ -19,6 +20,8 @@ st.set_page_config(
 BASE_DIR = Path(__file__).resolve().parent
 PRODUCT_INFO_PATH = BASE_DIR / "product_info.json"
 ERROR_REQUEST_PATH = BASE_DIR / "오류수정요청.xlsx"
+RECIPE_BOARD_PATH = BASE_DIR / "recipe_board.json"
+RECIPE_IMAGE_DIR = BASE_DIR / "recipe_board_images"
 ICON_DIR_CANDIDATES = [BASE_DIR / "icons", BASE_DIR / "아이콘"]
 MAP_COMPONENT_DIR = BASE_DIR / "korea_map_component"
 
@@ -543,6 +546,28 @@ def render_styles() -> None:
             color: #6b7280;
             font-size: 13px;
         }
+        .recipe-board-wrap {max-width:900px;margin:0 auto;background:#fff;border:1px solid #e5e7eb;border-radius:18px;padding:28px 34px;}
+        .recipe-board-head {display:flex;justify-content:space-between;align-items:center;padding-bottom:16px;border-bottom:1px solid #d1d5db;margin-bottom:24px;}
+        .recipe-board-title {font-size:24px;font-weight:900;letter-spacing:6px;color:#444;}
+        .recipe-sort {font-size:13px;color:#6b7280;}
+        .recipe-comment-card {display:flex;gap:14px;margin:24px 0 8px;}
+        .recipe-comment-card.reply {margin-left:56px;padding-left:18px;border-left:2px solid #e5e7eb;}
+        .recipe-avatar {width:38px;height:38px;border-radius:999px;background:linear-gradient(135deg,#ffe7c2,#f59e0b);flex-shrink:0;}
+        .recipe-comment-body {flex:1;}
+        .recipe-comment-name {font-size:14px;font-weight:800;color:#374151;}
+        .recipe-comment-time {font-size:12px;color:#9ca3af;margin-bottom:9px;}
+        .recipe-comment-text {font-size:14px;line-height:1.65;color:#333;white-space:pre-wrap;}
+        .recipe-comment-actions {font-size:12px;color:#6b7280;margin-top:8px;display:flex;gap:15px;}
+
+        /* 특산물 카드 하단 버튼 글자 크기/높이 조정 */
+        .stLinkButton a,
+        .stButton button {
+            font-size: 12px !important;
+            font-weight: 700 !important;
+            min-height: 42px !important;
+            padding: 0.25rem 0.35rem !important;
+            white-space: nowrap !important;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -571,10 +596,10 @@ def make_widget_key(*parts: object) -> str:
 
 def render_product_error_request_popover(region: str, city: str, product: str, key_prefix: str) -> None:
     """각 특산물 카드에 붙는 개별 오류수정요청 입력창입니다."""
-    error_popover = st.popover("오류수정요청", use_container_width=True)
+    error_popover = st.popover("수정요청", use_container_width=True)
 
     with error_popover:
-        st.subheader("오류수정요청")
+        st.subheader("수정요청")
         st.caption(f"{region} · {city} · {product}")
 
         request_text = st.text_area(
@@ -585,7 +610,7 @@ def render_product_error_request_popover(region: str, city: str, product: str, k
         )
 
         if st.button(
-            "오류수정요청 저장",
+            "수정요청 저장",
             type="primary",
             use_container_width=True,
             key=f"{key_prefix}_save_button",
@@ -605,6 +630,176 @@ def render_product_error_request_popover(region: str, city: str, product: str, k
                     st.success(msg)
                 else:
                     st.error(msg)
+
+
+
+def html_escape_text(value: object) -> str:
+    text = str(value or "")
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def load_recipe_posts() -> list[dict]:
+    if not RECIPE_BOARD_PATH.exists():
+        return []
+    try:
+        data = json.loads(RECIPE_BOARD_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def save_recipe_posts(posts: list[dict]) -> None:
+    RECIPE_BOARD_PATH.write_text(json.dumps(posts, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def save_recipe_image(uploaded_file):
+    if uploaded_file is None:
+        return ""
+    RECIPE_IMAGE_DIR.mkdir(exist_ok=True)
+    suffix = Path(uploaded_file.name).suffix.lower() or ".png"
+    filename = f"{uuid.uuid4().hex}{suffix}"
+    path = RECIPE_IMAGE_DIR / filename
+    path.write_bytes(uploaded_file.getbuffer())
+    return str(path.relative_to(BASE_DIR))
+
+
+def add_recipe_post(author: str, text: str, image_path: str = "", parent_id: str = "", context: dict | None = None) -> None:
+    posts = load_recipe_posts()
+    posts.append({
+        "id": uuid.uuid4().hex,
+        "parent_id": parent_id,
+        "author": (author or "익명").strip() or "익명",
+        "text": (text or "").strip(),
+        "image_path": image_path,
+        "likes": 0,
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "context": context or {},
+    })
+    save_recipe_posts(posts)
+
+
+
+
+def delete_recipe_post(post_id: str) -> None:
+    """댓글을 삭제합니다. 부모 댓글이면 연결된 대댓글도 함께 삭제합니다."""
+    posts = load_recipe_posts()
+    delete_ids = {post_id}
+    changed = True
+    while changed:
+        changed = False
+        for post in posts:
+            if post.get("parent_id") in delete_ids and post.get("id") not in delete_ids:
+                delete_ids.add(post.get("id"))
+                changed = True
+
+    remaining_posts = []
+    for post in posts:
+        if post.get("id") in delete_ids:
+            image_path = post.get("image_path")
+            if image_path:
+                try:
+                    full_path = BASE_DIR / image_path
+                    if full_path.exists() and full_path.is_file():
+                        full_path.unlink()
+                except Exception:
+                    pass
+        else:
+            remaining_posts.append(post)
+
+    save_recipe_posts(remaining_posts)
+
+def open_recipe_board(region: str, city: str, product: str) -> None:
+    st.session_state.page = "recipe_board"
+    st.session_state.recipe_board_context = {"region": region, "city": city, "product": product}
+    st.rerun()
+
+
+def render_one_recipe_comment(post: dict, is_reply: bool = False) -> None:
+    cls = "recipe-comment-card reply" if is_reply else "recipe-comment-card"
+    author = html_escape_text(post.get("author", "익명"))
+    created_at = html_escape_text(post.get("created_at", ""))
+    text = html_escape_text(post.get("text", ""))
+    st.markdown(f"""
+        <div class="{cls}">
+            <div class="recipe-avatar"></div>
+            <div class="recipe-comment-body">
+                <div class="recipe-comment-name">{author}</div>
+                <div class="recipe-comment-time">{created_at}</div>
+                <div class="recipe-comment-text">{text}</div>
+    """, unsafe_allow_html=True)
+    image_path = post.get("image_path")
+    if image_path:
+        full_path = BASE_DIR / image_path
+        if full_path.exists():
+            st.image(str(full_path), width=270)
+    st.markdown(f'<div class="recipe-comment-actions">❤ {post.get("likes", 0)} Likes <span>↪ Reply</span></div></div></div>', unsafe_allow_html=True)
+
+
+def render_delete_button(post: dict, is_reply: bool = False) -> None:
+    spacer, delete_col = st.columns([0.82, 0.18]) if not is_reply else st.columns([0.76, 0.24])
+    with delete_col:
+        if st.button("삭제", key=f"delete_recipe_{post.get('id')}", use_container_width=True):
+            delete_recipe_post(post.get("id", ""))
+            st.rerun()
+
+
+def render_recipe_board() -> None:
+    context = st.session_state.get("recipe_board_context", {})
+    context_text = " · ".join([x for x in [context.get("region"), context.get("city"), context.get("product")] if x])
+
+    st.markdown("## 당신의 요리를 자랑해보세요")
+    if context_text:
+        st.caption(context_text)
+
+    if st.button("← 특산물 지도로 돌아가기", key="back_to_map"):
+        st.session_state.page = "map"
+        st.rerun()
+
+    posts = load_recipe_posts()
+    current_posts = [p for p in posts if p.get("context", {}) == context] if context else posts
+
+    st.markdown('<div class="recipe-board-wrap">', unsafe_allow_html=True)
+    st.markdown(f'<div class="recipe-board-head"><div class="recipe-board-title">{len(current_posts)} COMMENTS</div><div class="recipe-sort">Sort by: Newest⌄</div></div>', unsafe_allow_html=True)
+
+    with st.form("new_recipe_comment", clear_on_submit=True):
+        author = st.text_input("이름", value="익명")
+        text = st.text_area("댓글", placeholder="Write a comment...", height=105)
+        image = st.file_uploader("이미지 첨부", type=["png", "jpg", "jpeg", "gif"], key="main_recipe_image")
+        submitted = st.form_submit_button("Publish")
+        if submitted:
+            if text.strip() or image is not None:
+                add_recipe_post(author, text, save_recipe_image(image), context=context)
+                st.rerun()
+            else:
+                st.warning("댓글 내용을 입력하거나 이미지를 첨부해주세요.")
+
+    posts = load_recipe_posts()
+    current_posts = [p for p in posts if p.get("context", {}) == context] if context else posts
+    parents = [p for p in current_posts if not p.get("parent_id")]
+    replies: dict[str, list[dict]] = {}
+    for post in current_posts:
+        if post.get("parent_id"):
+            replies.setdefault(post.get("parent_id"), []).append(post)
+
+    for post in reversed(parents):
+        render_one_recipe_comment(post)
+        render_delete_button(post)
+        for reply in replies.get(post["id"], []):
+            render_one_recipe_comment(reply, is_reply=True)
+            render_delete_button(reply, is_reply=True)
+        with st.expander(f"{post.get('author', '익명')}님 댓글에 답글 달기"):
+            with st.form(f"reply_form_{post['id']}", clear_on_submit=True):
+                r_author = st.text_input("이름", value="익명", key=f"reply_author_{post['id']}")
+                r_text = st.text_area("대댓글", placeholder="Replying...", key=f"reply_text_{post['id']}")
+                r_image = st.file_uploader("이미지 첨부", type=["png", "jpg", "jpeg", "gif"], key=f"reply_image_{post['id']}")
+                if st.form_submit_button("Reply"):
+                    if r_text.strip() or r_image is not None:
+                        add_recipe_post(r_author, r_text, save_recipe_image(r_image), parent_id=post["id"], context=context)
+                        st.rerun()
+                    else:
+                        st.warning("대댓글 내용을 입력하거나 이미지를 첨부해주세요.")
+
+    st.markdown('</div>', unsafe_allow_html=True)
 
 
 def render_product_panel(product_info: dict, product_icons: dict, selected_region: str | None) -> None:
@@ -640,7 +835,7 @@ def render_product_panel(product_info: dict, product_icons: dict, selected_regio
                 storage = info.get("보관방법", "JSON 파일에 보관방법을 입력해주세요.")
                 recipe_link = info.get("레시피링크", "")
                 recipe_url = recipe_link or f"https://www.google.com/search?q={quote_plus(product + ' 레시피')}"
-                recipe_label = "등록 레시피" if recipe_link else "레시피 검색"
+                recipe_label = "등록레시피" if recipe_link else "등록레시피"
 
                 st.markdown(
                     f"""
@@ -667,13 +862,20 @@ def render_product_panel(product_info: dict, product_icons: dict, selected_regio
                     city_index,
                     product_index,
                 )
-                recipe_col, error_col = st.columns([0.52, 0.48], gap="small")
+                recipe_col, board_col, error_col = st.columns([0.38, 0.36, 0.26], gap="small")
                 with recipe_col:
                     st.link_button(
                         recipe_label,
                         recipe_url,
                         use_container_width=True,
                     )
+                with board_col:
+                    if st.button(
+                        "레시피 게시판",
+                        use_container_width=True,
+                        key=f"{key_prefix}_recipe_board_button",
+                    ):
+                        open_recipe_board(selected_region, city, product)
                 with error_col:
                     render_product_error_request_popover(selected_region, city, product, key_prefix)
 
@@ -681,10 +883,10 @@ def render_error_request_form() -> None:
     bottom_left, bottom_right = st.columns([0.85, 0.15])
 
     with bottom_right:
-        error_popover = st.popover("오류수정요청", use_container_width=True)
+        error_popover = st.popover("수정요청", use_container_width=True)
 
     with error_popover:
-        st.subheader("오류수정요청")
+        st.subheader("수정요청")
         st.caption("지도에서 확인한 오류를 선택 후 저장하면 오류수정요청.xlsx에 누적됩니다.")
 
         region_names = list(REGION_DATA.keys())
@@ -709,7 +911,7 @@ def render_error_request_form() -> None:
             height=120,
         )
 
-        if st.button("오류수정요청 저장", type="primary", use_container_width=True):
+        if st.button("수정요청 저장", type="primary", use_container_width=True):
             if not request_text.strip():
                 st.warning("수정내용을 입력해주세요.")
             else:
@@ -732,6 +934,14 @@ def main() -> None:
 
     if "selected_region" not in st.session_state:
         st.session_state.selected_region = None
+    if "page" not in st.session_state:
+        st.session_state.page = "map"
+    if "recipe_board_context" not in st.session_state:
+        st.session_state.recipe_board_context = {}
+
+    if st.session_state.page == "recipe_board":
+        render_recipe_board()
+        return
 
     st.title("전국 특산물 지도")
     st.caption("지도 권역을 클릭하면 오른쪽 특산물 목록이 Streamlit 영역에서 갱신됩니다.")
