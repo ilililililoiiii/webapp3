@@ -1,0 +1,313 @@
+
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+<style>
+*{box-sizing:border-box}
+body{margin:0;font-family:'Pretendard','Noto Sans KR',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#ffffff;color:#111827}
+.mapbox{background:#ffffff;border:1px solid #e5e7eb;border-radius:16px;padding:14px;min-height:720px;position:relative}
+#map{width:100%;height:auto;display:block}
+.province{stroke:#fff;stroke-width:1.4;stroke-linejoin:round;stroke-linecap:round;cursor:pointer;transition:filter .12s, opacity .12s, fill .12s;vector-effect:non-scaling-stroke;opacity:.88}
+.province:hover{filter:brightness(1.05) drop-shadow(0 2px 3px rgba(0,0,0,.18))}
+.province.dimmed{opacity:.34}
+.province.active{stroke:#111;stroke-width:2.2;filter:drop-shadow(0 2px 5px rgba(0,0,0,.22));opacity:.95}
+.selected-outline{fill:none;stroke:#111;stroke-width:2.2;stroke-linejoin:round;stroke-linecap:round;pointer-events:none;vector-effect:non-scaling-stroke;filter:drop-shadow(0 2px 5px rgba(0,0,0,.22))}
+.label-bg{fill:rgba(255,255,255,.82);stroke:#e5e7eb;stroke-width:1}
+.label{font-size:13px;font-weight:800;text-anchor:middle;dominant-baseline:middle;pointer-events:none;paint-order:stroke;stroke:#fff;stroke-width:3px;stroke-linejoin:round}
+.inset-title{font-size:13px;font-weight:900;text-anchor:middle;pointer-events:none}
+.inset-box{fill:#fff;stroke:#9ca3af;stroke-dasharray:4 3;rx:10}
+.tip{position:fixed;display:none;z-index:50;background:rgba(17,24,39,.92);color:white;border-radius:9px;padding:8px 10px;font-size:12px;pointer-events:none;line-height:1.5;max-width:250px}
+.island-hit{fill:rgba(255,255,255,0.001);stroke:none;pointer-events:all;cursor:pointer}
+.map-note{position:absolute;left:18px;bottom:14px;color:#6b7280;font-size:12px;background:rgba(255,255,255,.82);border:1px solid #e5e7eb;border-radius:10px;padding:7px 9px}
+</style>
+</head>
+<body>
+<div class="mapbox">
+  <svg id="map" viewBox="0 0 650 780" role="img" aria-label="대한민국 권역별 지도"></svg>
+  <div class="map-note">권역을 클릭하면 오른쪽 특산물 목록이 변경됩니다.</div>
+</div>
+<div class="tip" id="tip"></div>
+<script>
+let args = {};
+let REGION_DATA = {};
+let REGION_ORDER = [];
+let SELECTED_REGION = null;
+let GEO_URLS = [];
+let GEO_CACHE = null;
+let DRAW_TOKEN = 0;
+let LAST_WIDTH = 0;
+
+function sendMessage(type, data) {
+  window.parent.postMessage({isStreamlitMessage: true, type, ...data}, "*");
+}
+function componentReady() {
+  sendMessage("streamlit:componentReady", {apiVersion: 1});
+}
+function setFrameHeight(height) {
+  sendMessage("streamlit:setFrameHeight", {height});
+}
+function updateFrameHeight() {
+  const mapbox = document.querySelector('.mapbox');
+  const height = Math.ceil((mapbox ? mapbox.getBoundingClientRect().height : document.body.scrollHeight) + 8);
+  setFrameHeight(Math.max(height, 740));
+}
+function setComponentValue(value) {
+  sendMessage("streamlit:setComponentValue", {value, dataType: "json"});
+}
+function onRender(event) {
+  if (!event.data || event.data.type !== "streamlit:render") return;
+  args = event.data.args || {};
+  REGION_DATA = args.region_data || {};
+  REGION_ORDER = args.region_order || Object.keys(REGION_DATA);
+  SELECTED_REGION = args.selected_region || null;
+  GEO_URLS = args.geo_urls || [];
+  scheduleDraw();
+}
+
+window.addEventListener("message", onRender);
+window.addEventListener("resize", () => scheduleDraw());
+
+function scheduleDraw() {
+  const token = ++DRAW_TOKEN;
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      if (token !== DRAW_TOKEN) return;
+      const mapbox = document.querySelector('.mapbox');
+      const width = mapbox ? mapbox.getBoundingClientRect().width : window.innerWidth;
+      if (!width || width < 40) {
+        setTimeout(() => { if (token === DRAW_TOKEN) scheduleDraw(); }, 80);
+        return;
+      }
+      LAST_WIDTH = width;
+      drawMap().then(updateFrameHeight);
+    });
+  });
+}
+
+if ('ResizeObserver' in window) {
+  const ro = new ResizeObserver(entries => {
+    const w = entries[0]?.contentRect?.width || 0;
+    if (Math.abs(w - LAST_WIDTH) > 2) scheduleDraw();
+    updateFrameHeight();
+  });
+  window.addEventListener('load', () => {
+    const mapbox = document.querySelector('.mapbox');
+    if (mapbox) ro.observe(mapbox);
+    scheduleDraw();
+  });
+} else {
+  window.addEventListener('load', scheduleDraw);
+}
+
+componentReady();
+
+const ALIASES={'서울':'서울특별시','부산':'부산광역시','대구':'대구광역시','인천':'인천광역시','광주':'광주광역시','대전':'대전광역시','울산':'울산광역시','세종':'세종특별자치시','경기':'경기도','강원':'강원도','충북':'충청북도','충남':'충청남도','전북':'전라북도','전남':'전라남도','경북':'경상북도','경남':'경상남도','제주':'제주특별자치도'};
+function cleanName(v){if(!v) return ''; let s=String(v).trim(); return ALIASES[s]||s;}
+function getProvinceName(p){const keys=['CTP_KOR_NM','CTPRVN_NM','SIDO_NM','NAME_1','name','Name','NAME','adm_nm']; for(const k of keys) if(p&&p[k]) return cleanName(p[k]); return '';}
+function regionForFeature(f){
+  const provinceToRegion={};
+  Object.entries(REGION_DATA).forEach(([r,d])=>(d.provinceNames||[]).forEach(n=>provinceToRegion[n]=r));
+  let n=getProvinceName(f.properties);
+  if(provinceToRegion[n]) return provinceToRegion[n];
+  const vals=Object.values(f.properties||{}).map(cleanName);
+  for(const v of vals) if(provinceToRegion[v]) return provinceToRegion[v];
+  return null;
+}
+function ringArea(coords){let a=0; for(let i=0,j=coords.length-1;i<coords.length;j=i++){const p=coords[i], q=coords[j]; a += (q[0]*p[1] - p[0]*q[1]);} return Math.abs(a/2);}
+function polygonCentroidLon(poly){const ring=(poly&&poly[0])||[]; if(!ring.length) return 0; let sum=0; ring.forEach(p=>{sum+=+p[0]||0;}); return sum/ring.length;}
+function keepMainlandPolygon(feature, poly){
+ const r=regionForFeature(feature);
+ const name=getProvinceName(feature.properties);
+ const lon=polygonCentroidLon(poly);
+ const area=ringArea((poly&&poly[0])||[]);
+ if(r==='경상북도' && name==='경상북도') return lon < 130.2;
+ if(r==='서울경기' && (name==='인천광역시' || name==='경기도')) return lon > 126.55 && area > 0.00005;
+ return true;
+}
+function sanitizeFeature(feature){
+ const geom=feature.geometry;
+ if(!geom) return feature;
+ const r=regionForFeature(feature);
+ const name=getProvinceName(feature.properties);
+ if(geom.type==='MultiPolygon'){
+   let coordinates=geom.coordinates.filter(poly=>keepMainlandPolygon(feature, poly));
+   if((r==='서울경기' && (name==='인천광역시' || name==='경기도')) || (r==='경상북도' && name==='경상북도')){
+     coordinates=coordinates
+       .map(poly=>({poly, area:ringArea((poly&&poly[0])||[])}))
+       .sort((a,b)=>b.area-a.area)
+       .slice(0,1)
+       .map(item=>item.poly);
+   }
+   if(!coordinates.length) return null;
+   return {...feature, geometry:{...geom, coordinates}};
+ }
+ if(geom.type==='Polygon') return keepMainlandPolygon(feature, geom.coordinates) ? feature : null;
+ return feature;
+}
+async function loadGeo(){
+ let last;
+ for(const url of GEO_URLS){
+   try{
+     const res=await fetch(url);
+     if(!res.ok) throw new Error(res.status);
+     return await res.json();
+   }catch(e){last=e;}
+ }
+ throw last||new Error('지도 데이터를 불러오지 못했습니다.');
+}
+async function loadGeoCached(){
+ if(GEO_CACHE) return GEO_CACHE;
+ GEO_CACHE = await loadGeo();
+ return GEO_CACHE;
+}
+function esc(s){return String(s).replace(/[&<>'"]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[m]));}
+
+async function drawMap(){
+  const svg=d3.select('#map');
+  const tip=document.getElementById('tip');
+  svg.selectAll("*").remove();
+
+  try {
+    const geo = await loadGeoCached();
+    const W=650, H=780;
+    const features=geo.features.map(sanitizeFeature).filter(f=>f&&regionForFeature(f));
+    const projection=d3.geoMercator().fitExtent([[35,25],[595,735]], {type:'FeatureCollection',features});
+    const path=d3.geoPath(projection);
+
+    svg.append('rect').attr('x',0).attr('y',0).attr('width',W).attr('height',H).attr('fill','transparent');
+
+    svg.selectAll('path.province')
+      .data(features)
+      .join('path')
+      .attr('class',d=>{
+        const r=regionForFeature(d);
+        let cls='province';
+        if(SELECTED_REGION && r!==SELECTED_REGION) cls+=' dimmed';
+        if(SELECTED_REGION && r===SELECTED_REGION) cls+=' active';
+        return cls;
+      })
+      .attr('d',path)
+      .attr('fill',d=>REGION_DATA[regionForFeature(d)].color)
+      .on('click',(event,d)=>{
+        const r=regionForFeature(d);
+        SELECTED_REGION = r;
+        setComponentValue(r);
+      })
+      .on('mousemove',(event,d)=>{
+        const r=regionForFeature(d);
+        const rows=(REGION_DATA[r].cities||[]).slice(0,4).map(c=>`${c.name} - ${c.p}`).join('<br>');
+        tip.style.display='block';
+        tip.style.left=event.clientX+12+'px';
+        tip.style.top=event.clientY-28+'px';
+        tip.innerHTML=`<b>${esc(r)}</b><br>${rows}`;
+      })
+      .on('mouseleave',()=>tip.style.display='none');
+
+    const selectedFeatures = features.filter(f=>regionForFeature(f)===SELECTED_REGION);
+    if(selectedFeatures.length && SELECTED_REGION!=='울릉도' && SELECTED_REGION!=='독도'){
+      svg.append('g').attr('class','selected-outline-layer')
+        .selectAll('path')
+        .data(selectedFeatures)
+        .join('path')
+        .attr('class','selected-outline')
+        .attr('d',path);
+    }
+
+    const labelAnchorRatio={'서울경기':[0.50,0.47],'강원도':[0.56,0.43],'충청남도':[0.43,0.50],'충청북도':[0.53,0.51],'전라북도':[0.48,0.50],'전라남도':[0.45,0.55],'경상북도':[0.57,0.49],'경상남도':[0.55,0.53],'제주도':[0.50,0.50]};
+    const labelWidth={'서울경기':104,'강원도':88,'충청남도':104,'충청북도':104,'전라북도':104,'전라남도':104,'경상북도':104,'경상남도':104,'제주도':132};
+    function featureCollectionForRegion(r){return {type:'FeatureCollection',features:features.filter(f=>regionForFeature(f)===r)};}
+    function anchorByBounds(r){
+      const fc=featureCollectionForRegion(r);
+      if(!fc.features.length) return null;
+      if(r==='경상북도') return path.centroid(fc);
+      const b=path.bounds(fc);
+      const ratio=labelAnchorRatio[r]||[0.5,0.5];
+      return [b[0][0]+(b[1][0]-b[0][0])*ratio[0], b[0][1]+(b[1][1]-b[0][1])*ratio[1]];
+    }
+    function drawRegionLabel(r,x,y){
+      const w=labelWidth[r]||96;
+      const g=svg.append('g').attr('class','region-name').style('pointer-events','none');
+      g.append('rect').attr('class','label-bg').attr('x',x-w/2).attr('y',y-17).attr('width',w).attr('height',34).attr('rx',17);
+      g.append('text').attr('class','label').attr('x',x).attr('y',y).attr('fill',REGION_DATA[r].color).text(r);
+    }
+    ['서울경기','강원도','충청남도','충청북도','전라북도','전라남도','경상북도','경상남도','제주도']
+      .forEach(r=>{const p=anchorByBounds(r); if(p) drawRegionLabel(r,p[0],p[1]);});
+
+    function polygonFeatureFromCoords(coords, region, name){
+      return {type:'Feature', properties:{name:name, region:region}, geometry:{type:'Polygon', coordinates:coords}};
+    }
+    function extractIslandFeaturesFromOriginalGeo(sourceGeo){
+      const islands={ulleung:[], dokdo:[]};
+      (sourceGeo.features||[]).forEach(f=>{
+        const name=getProvinceName(f.properties);
+        if(name!=='경상북도' || !f.geometry) return;
+        const polys=f.geometry.type==='MultiPolygon' ? f.geometry.coordinates : (f.geometry.type==='Polygon' ? [f.geometry.coordinates] : []);
+        polys.forEach(poly=>{
+          const lon=polygonCentroidLon(poly);
+          const area=ringArea((poly&&poly[0])||[]);
+          if(lon<=130.2 || area<=0) return;
+          if(lon<131.4) islands.ulleung.push(polygonFeatureFromCoords(poly,'울릉도','울릉도'));
+          else islands.dokdo.push(polygonFeatureFromCoords(poly,'독도','독도'));
+        });
+      });
+      return islands;
+    }
+    const islands=extractIslandFeaturesFromOriginalGeo(geo);
+    const islandLayer=svg.append('g').attr('class','island-inset');
+
+    function drawIslandInset(config){
+      const {region, className, features, x, y, color}=config;
+      const boxW=82.5, boxH=77.5;
+      const active = SELECTED_REGION===region;
+      const dimmed = SELECTED_REGION && SELECTED_REGION!==region;
+      const box= islandLayer.append('g').attr('class',className).style('cursor','pointer')
+        .on('click',()=>{SELECTED_REGION=region; setComponentValue(region);})
+        .on('mousemove',(event)=>{
+          tip.style.display='block';
+          tip.style.left=event.clientX+12+'px';
+          tip.style.top=event.clientY-28+'px';
+          tip.innerHTML=`<b>${esc(region)}</b><br>${REGION_DATA[region].cities[0].name} - ${REGION_DATA[region].cities[0].p}`;
+        })
+        .on('mouseleave',()=>tip.style.display='none');
+      box.append('rect')
+        .attr('class','inset-box')
+        .attr('x',x).attr('y',y).attr('width',boxW).attr('height',boxH)
+        .attr('stroke', active ? '#111' : '#9ca3af')
+        .attr('stroke-width', active ? 2.2 : 1);
+      box.append('text').attr('class','inset-title').attr('x',x+boxW/2).attr('y',y+18).style('font-size','12px').text(region);
+      if(features.length){
+        const projection=d3.geoMercator().fitExtent([[x+13,y+30],[x+boxW-13,y+boxH-10]], {type:'FeatureCollection',features});
+        const islandPath=d3.geoPath(projection);
+        box.selectAll('path.island').data(features).join('path')
+          .attr('class','province island')
+          .attr('d',islandPath)
+          .attr('fill',color)
+          .attr('opacity',dimmed ? .34 : .88)
+          .attr('stroke',active ? '#111' : '#334155')
+          .attr('stroke-width',active ? 2.2 : 1);
+      }else{
+        box.append('text').attr('x',x+boxW/2).attr('y',y+boxH/2+10).attr('text-anchor','middle').attr('fill','#64748b').style('font-size','10px').text('GeoJSON 없음');
+      }
+      box.append('rect')
+        .attr('class','island-hit')
+        .attr('x',x).attr('y',y).attr('width',boxW).attr('height',boxH)
+        .on('click',()=>{SELECTED_REGION=region; setComponentValue(region);})
+        .on('mousemove',(event)=>{
+          tip.style.display='block';
+          tip.style.left=event.clientX+12+'px';
+          tip.style.top=event.clientY-28+'px';
+          tip.innerHTML=`<b>${esc(region)}</b><br>${REGION_DATA[region].cities[0].name} - ${REGION_DATA[region].cities[0].p}`;
+        })
+        .on('mouseleave',()=>tip.style.display='none');
+    }
+    drawIslandInset({region:'울릉도', className:'ulleung', features:islands.ulleung, x:515, y:110, color:REGION_DATA['울릉도'].color});
+    drawIslandInset({region:'독도', className:'dokdo', features:islands.dokdo, x:515, y:200, color:REGION_DATA['독도'].color});
+  } catch(e) {
+    document.querySelector('.mapbox').innerHTML='<div style="color:#b91c1c;background:#fff1f2;border:1px solid #fecdd3;border-radius:12px;padding:12px;line-height:1.6"><b>지도 데이터를 불러오지 못했습니다.</b><br>인터넷 연결 상태에서 다시 실행해주세요.<br>'+e.message+'</div>';
+  }
+}
+</script>
+</body>
+</html>
